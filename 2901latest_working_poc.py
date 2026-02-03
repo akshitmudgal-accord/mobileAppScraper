@@ -26,8 +26,100 @@ options.no_reset = True
 options.full_reset = False
 options.auto_grant_permissions = True
 
+
+# ENSURE APP IS READY
+
+def ensure_app_ready(driver):
+    """Ensure app is in foreground and ready to use"""
+    print("🔍 Checking app state...")
+    
+    try:
+        # Method 1: Check app state
+        app_state = driver.query_app_state("com.dubizzle.dealerapp")
+        
+        state_descriptions = {
+            0: "Not installed",
+            1: "Not running",
+            2: "Running in background (suspended)",
+            3: "Running in background",
+            4: "Running in foreground"
+        }
+        
+        state_desc = state_descriptions.get(app_state, "Unknown")
+        print(f"  📱 App state: {app_state} ({state_desc})")
+        
+        if app_state == 0:
+            print("❌ App not installed!")
+            return False
+        elif app_state == 1:
+            print("⚠️ App not running, launching...")
+            driver.activate_app("com.dubizzle.dealerapp")
+            time.sleep(10)
+        elif app_state in [2, 3]:
+            print("⚠️ App in background, bringing to foreground...")
+            driver.activate_app("com.dubizzle.dealerapp")
+            time.sleep(5)
+        else:
+            print("✅ App already in foreground")
+        
+        # Method 2: Verify app is actually responding
+        print("🔍 Verifying app is responsive...")
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((AppiumBy.ACCESSIBILITY_ID, "Alerts"))
+            )
+            print("  ✅ App is responsive and ready")
+            return True
+        except:
+            print("⚠️ App not responding to UI queries")
+            print("🔄 Attempting restart...")
+            
+            # Restart app
+            try:
+                driver.terminate_app("com.dubizzle.dealerapp")
+                time.sleep(3)
+                print("  📱 App terminated, relaunching...")
+                driver.activate_app("com.dubizzle.dealerapp")
+                time.sleep(15)
+            except Exception as restart_error:
+                print(f"  ⚠️ Error during restart: {restart_error}")
+                time.sleep(15)
+            
+            # Final check
+            try:
+                WebDriverWait(driver, 30).until(
+                    EC.presence_of_element_located((AppiumBy.ACCESSIBILITY_ID, "Alerts"))
+                )
+                print("✅ App restarted successfully and is responsive")
+                return True
+            except:
+                print("❌ App still not responding after restart")
+                return False
+                
+    except Exception as e:
+        print(f"❌ Error checking app state: {e}")
+        print("🔄 Attempting to activate app anyway...")
+        try:
+            driver.activate_app("com.dubizzle.dealerapp")
+            time.sleep(10)
+            print("✅ App activated")
+            return True
+        except:
+            print("❌ Could not activate app")
+            return False
+
+# =====================================================
+# DRIVER CONNECTION
+# =====================================================
 driver = webdriver.Remote("http://127.0.0.1:4723", options=options)
 driver.implicitly_wait(7)
+
+# Ensure app is in foreground and ready to handle idle state
+if not ensure_app_ready(driver):
+    print("❌ Could not ensure app is ready, exiting...")
+    driver.quit()
+    exit(1)
+
 time.sleep(10)  # Basic initial wait
 
 print("⏳ Waiting for app to fully initialize...")
@@ -725,7 +817,66 @@ def scrape_new_alerts_on_screen(existing_cache_keys):
                                 except:
                                     continue
                             
-                            # Compare titles on first check
+                            #NEW: If title is None, PDP didn't load - retry click
+                            if actual_title is None:
+                                print(f"  ⚠️ PDP did not load (title is None)")
+                                print(f"  🔄 Retrying click with longer wait...")
+                                
+                                # Go back first (in case we're stuck somewhere)
+                                try:
+                                    driver.back()
+                                    time.sleep(2)
+                                except:
+                                    pass
+                                
+                                # Refresh the alert list and find the card again
+                                live_alerts_retry = get_all_live_alerts()
+                                card_found = False
+                                
+                                for card_retry, desc_retry in live_alerts_retry:
+                                    if desc_retry == alert_desc:
+                                        try:
+                                            print("  👆 Attempting second click...")
+                                            time.sleep(1)
+                                            card_retry.click()
+                                            time.sleep(7)  # Longer wait on retry
+                                            time.sleep(3)  # Extra stabilization
+                                            
+                                            # Try to get title again
+                                            texts_retry = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                                            actual_title = None
+                                            
+                                            for i in range(len(texts_retry)):
+                                                try:
+                                                    txt = texts_retry[i].text.strip()
+                                                    if txt.startswith("Ref") and i > 0:
+                                                        actual_title = texts_retry[i - 1].text.strip()
+                                                        break
+                                                except:
+                                                    continue
+                                            
+                                            if actual_title is None:
+                                                print(f"  ❌ PDP still did not load after retry")
+                                                print(f"  ⬅️ Going back and skipping this listing...")
+                                                try:
+                                                    driver.back()
+                                                    time.sleep(2)
+                                                except:
+                                                    pass
+                                                card_found = True
+                                                break
+                                            else:
+                                                print(f"  ✅ PDP loaded successfully on retry: {actual_title}")
+                                                card_found = True
+                                                break
+                                        except Exception as retry_error:
+                                            print(f"  ❌ Error during retry: {retry_error}")
+                                            break
+                                
+                                if not card_found or actual_title is None:
+                                    break  # Skip to next alert in outer loop
+                            
+                            # Compare titles on first check (if we got a title)
                             if actual_title and expected_title:
                                 if actual_title != expected_title:
                                     print(f"  ❌ WRONG PDP on first check!")
@@ -737,6 +888,10 @@ def scrape_new_alerts_on_screen(existing_cache_keys):
                                     break  # Skip to next alert in outer loop
                                 else:
                                     print(f"  ✅ First check passed: {actual_title}")
+                            elif actual_title is None:
+                                # Already handled by retry logic above
+                                print(f"  ℹ️ Skipping due to PDP load failure")
+                                break
                             else:
                                 print(f"  ⚠️ Could not verify on first check (Expected: {expected_title}, Got: {actual_title})")
                                 print("  ℹ️ Proceeding to second verification...")
@@ -744,6 +899,10 @@ def scrape_new_alerts_on_screen(existing_cache_keys):
                         except Exception as verify_error:
                             print(f"  ⚠️ Error during first verification: {verify_error}")
                             print("  ℹ️ Proceeding to second verification...")
+                        
+                        # Check if we should continue (title must not be None at this point)
+                        if actual_title is None:
+                            break  # Skip to next alert
                         
                         # STEP 3: Wait and re-verify (catch the "blink" issue)
                         print("  🔍 Second verification - checking if PDP changed...")
